@@ -26,6 +26,11 @@ param (
     [Parameter(Mandatory=$false)]
     [string]$ip,
 
+    # Path to Splunk Cloud credentials package
+    [Parameter(Mandatory=$false)]
+    [Alias('c')]
+    [string]$CloudCredentialsPath = "",
+
     # GitHub URL to download resources from
     [Parameter(Mandatory=$false)]
     [string]$GithubUrl = "",
@@ -123,10 +128,12 @@ function print_usage {
     Write-Host "  .\splunk.ps1 -ip <INDEXER IP> [flags]" -ForegroundColor Cyan
     Write-Host "  .\splunk.ps1 -indexer [flags]" -ForegroundColor Cyan
     Write-Host "  .\splunk.ps1 -ResetPassword" -ForegroundColor Cyan
+    Write-Host "  .\splunk.ps1 -c <CREDENTIALS_PATH> [flags]" -ForegroundColor Cyan
     Write-Host
     Write-Host "Flags:" -ForegroundColor Green
     Write-Host "  -h                 Show this help message" -ForegroundColor Yellow
     Write-Host "  -ip                IP address of Splunk indexer to forward to" -ForegroundColor Yellow
+    Write-Host "  -c <path>          Install forwarder with Splunk Cloud credentials" -ForegroundColor Yellow
     Write-Host "  -indexer           Install Splunk indexer instead of forwarder" -ForegroundColor Yellow
     Write-Host "  -ResetPassword     Reset the Splunk admin password" -ForegroundColor Yellow
     Write-Host "  -WindowsVersion    Specify Windows version (auto-detected if not provided)" -ForegroundColor Yellow
@@ -277,7 +284,7 @@ function detect_version {
                 "Windows 8" = $7_3_9_x64
                 "Windows Server 2012" = $9_1_6_x64
                 "Windows Server 2012 R2" = $9_1_6_x64
-                "Windows Server 2016" = $10_0_2_x64
+                "Windows Server 2016" = $uf_x64
                 "Windows 10" = $uf_x64
                 "Windows 11" = $uf_x64
                 "Windows Server 2019" = $uf_x64
@@ -294,7 +301,7 @@ function detect_version {
                 "Windows 8" = $7_3_9_x86
                 "Windows Server 2012" = $9_1_6_x86
                 "Windows Server 2012 R2" = $9_1_6_x86
-                "Windows Server 2016" = $10_0_2_x86
+                "Windows Server 2016" = $null
                 "Windows 10" = $uf_x86
                 "Windows 11" = $uf_x86
                 "Windows Server 2019" = $uf_x86
@@ -383,13 +390,14 @@ function handle_args {
         }
     }
     
-    # Check if we are installing an indexer
+    # Check if we are installing an indexer or forwarder
     if ($indexer) {
         $script:SPLUNKDIR = "C:\Program Files\Splunk"  # TODO: check this path
         $script:SPLUNK_SERVICE = "Splunkd"
     } else {
-        if ($ip -eq "" -and -not $ResetPassword) {
-            _error "Please provide the IP address of the Splunk indexer to forward to using the -ip parameter."
+        # Allow either traditional forwarding or Splunk Cloud
+        if (-not $ip -and -not $CloudCredentialsPath -and -not $ResetPassword) {
+            _error "Provide -ip <address> or -c <credentials_path>"
             exit 1
         }
     }
@@ -400,12 +408,37 @@ function handle_args {
         exit 0
     }
 
+    # Validate Splunk Cloud configuration
+    if ($CloudCredentialsPath) {
+
+        # Cannot combine Cloud with indexer or IP mode
+        if ($indexer -or $ip) {
+            _error "Cannot combine -c with -indexer or -ip"
+            exit 1
+        }
+
+        # Check if credentials file exists
+        if (-not (Test-Path -LiteralPath $CloudCredentialsPath -PathType Leaf)) {
+            _error "Cloud credentials file not found: $CloudCredentialsPath"
+            exit 1
+        }
+
+        # Convert to absolute path
+        $script:CloudCredentialsPath = (
+            Resolve-Path -LiteralPath $CloudCredentialsPath
+        ).ProviderPath
+
+        info "Using Splunk Cloud credentials: $CloudCredentialsPath"
+    }
+
+    # Custom GitHub URL
     if ($GithubUrl -ne "") {
         debug "Using custom GitHub URL: $GithubUrl"
         # TODO: trim trailing slash
         $script:GITHUB_URL = $GithubUrl
     }
 
+    # Local repository installation
     if ($local -ne "") {
         $script:LOCAL_INSTALL = $true
         $script:GITHUB_URL = (Resolve-Path "$local").Path.TrimEnd('\')
@@ -452,6 +485,12 @@ function install_splunk {
         download $msi $installer_path
     }
 
+    # Verify installer was downloaded
+    if (-not (Test-Path $installer_path)) {
+        _error "Splunk installer not found: $installer_path"
+        exit 1
+    }
+
     info "Please enter a password for the $SPLUNK_USERNAME user."
     warning "This needs to be at least 8 characters and match system password complexity requirements or else the install will fail!"
     $script:SPLUNK_PASSWORD = get_password
@@ -459,10 +498,26 @@ function install_splunk {
     info "The installation will now continue in the background. This may take a few minutes."
     # TODO: create splunk service user
     debug "Installer path: $installer_path"
-    if ($indexer) {
-        Start-Process msiexec.exe -ArgumentList "/i $installer_path SPLUNKUSERNAME=$SPLUNK_USERNAME SPLUNKPASSWORD=$script:SPLUNK_PASSWORD USE_LOCAL_SYSTEM=1 AGREETOLICENSE=yes LAUNCHSPLUNK=1 SERVICESTARTTYPE=auto /L*v splunk_log.txt /quiet" -Wait -NoNewWindow
-    } else {
-        Start-Process msiexec.exe -ArgumentList "/i $installer_path SPLUNKUSERNAME=$SPLUNK_USERNAME SPLUNKPASSWORD=$script:SPLUNK_PASSWORD USE_LOCAL_SYSTEM=1 RECEIVING_INDEXER=`"$($ip):9997`" AGREETOLICENSE=yes LAUNCHSPLUNK=1 SERVICESTARTTYPE=auto /L*v splunk_log.txt /quiet" -Wait -NoNewWindow
+
+    # Base MSI installation arguments
+    $msiArgs = "/i `"$installer_path`" SPLUNKUSERNAME=$SPLUNK_USERNAME SPLUNKPASSWORD=`"$script:SPLUNK_PASSWORD`" USE_LOCAL_SYSTEM=1 AGREETOLICENSE=yes LAUNCHSPLUNK=1 SERVICESTARTTYPE=auto /L*v `"$pwd\splunk_log.txt`" /quiet"
+    # Only configure receiving indexer for traditional forwarders
+    if (-not $indexer -and -not $CloudCredentialsPath) {
+        $msiArgs += " RECEIVING_INDEXER=`"${ip}:9997`""
+    }
+
+    # Execute MSI installation
+    $process = Start-Process msiexec.exe `
+        -ArgumentList $msiArgs `
+        -Wait -NoNewWindow -PassThru
+
+    # Check installation result
+    if ($process.ExitCode -notin @(0, 3010)) {
+        _error "Splunk MSI installation failed: $($process.ExitCode)"
+        exit 1
+    }
+    if ($process.ExitCode -eq 3010) {
+        warning "Splunk installation requires a reboot."
     }
 
     debug "Testing path at $SPLUNKDIR\bin\splunk.exe"
@@ -534,6 +589,25 @@ function install_app {
     $app_path = Join-Path $SPLUNKDIR "etc\apps\$app_folder"
     icacls $app_path /grant "SYSTEM:F" /T /C > $null 2>&1
 }
+
+function install_cloud_credentials {
+    info "Installing Splunk Cloud credentials..."
+
+    $package = (Resolve-Path `
+        -LiteralPath $CloudCredentialsPath `
+        -ErrorAction Stop).ProviderPath
+
+    $splunkExe = Join-Path $SPLUNKDIR "bin\splunk.exe"
+
+    & $splunkExe install app $package -update 1
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install Splunk Cloud credentials"
+    }
+
+    info "Splunk Cloud credentials installed successfully"
+}
+
 #####################################################
 
 ######################## MAIN #######################
@@ -609,9 +683,26 @@ if ($script:WindowsVersion -eq "Windows 7" -or $script:WindowsVersion -eq "Windo
 enable_auditing
 Write-Host
 
+# Install Splunk Cloud credentials if requested
+if ($CloudCredentialsPath) {
+    try {
+        install_cloud_credentials
+    } catch {
+        _error "Cloud configuration failed: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
 # Set Splunk service to start automatically
 Set-Service -Name $SPLUNK_SERVICE -StartupType Automatic
 
 info "Restarting Splunk service..."
-Restart-Service $SPLUNK_SERVICE
+Restart-Service $SPLUNK_SERVICE -ErrorAction Stop
+
+# Verify forwarding configuration
+if ($CloudCredentialsPath) {
+    info "Checking Splunk Cloud forwarding status..."
+
+    & "$SPLUNKDIR\bin\splunk.exe" list forward-server
+}
 #####################################################

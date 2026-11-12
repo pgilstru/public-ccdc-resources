@@ -19,6 +19,7 @@
 LOG='/var/log/ccdc/splunk.log'
 GITHUB_URL="https://raw.githubusercontent.com/BYU-CCDC/public-ccdc-resources/main"
 INDEXES=( 'nix' 'windows' 'web' 'network' 'snoopy' 'ossec' 'edr' )
+CLOUD_CREDENTIALS=""
 PM=""
 IP=""
 INDEXER=false
@@ -294,6 +295,7 @@ function print_usage {
     echo "  $(set_ansi $BLUE $BOLD)./splunk.sh -i [flags]                      $(set_ansi)# Install the indexer"
     echo "  $(set_ansi $BLUE $BOLD)./splunk.sh -a <LOG_PATH>                   $(set_ansi)# Add a new monitor"
     echo "  $(set_ansi $BLUE $BOLD)./splunk.sh -D                              $(set_ansi)# Debug installation if it's not working"
+    echo "  $(set_ansi $BLUE $BOLD)./splunk.sh -c <CREDENTIALS_PATH> [flags]   $(set_ansi)# Install the Cloud forwarder"
     echo
     echo "$(set_ansi $GREEN $BOLD)Flags:$(set_ansi)
   $(set_ansi $YELLOW $BOLD)-h            $(set_ansi)Show this help message
@@ -303,6 +305,7 @@ function print_usage {
   $(set_ansi $YELLOW $BOLD)-v <version>  $(set_ansi)Install a specific Splunk version other than the latest (supported old versions: 9.2.10, 9.0.9)
   $(set_ansi $YELLOW $BOLD)-d            $(set_ansi)Download the Splunk package without installing
   $(set_ansi $YELLOW $BOLD)-r            $(set_ansi)Reinstall Splunk
+  $(set_ansi $YELLOW $BOLD)-c <path>     $(set_ansi)Install forwarder using Splunk Cloud credentials
   $(set_ansi $YELLOW $BOLD)-u            $(set_ansi)Print Splunk package URLs
   $(set_ansi $YELLOW $BOLD)-S            $(set_ansi)Install Splunk only (no additional logging)
   $(set_ansi $YELLOW $BOLD)-L            $(set_ansi)Install additional logging sources only (no Splunk)
@@ -535,11 +538,27 @@ function install_dependencies {
 }
 
 function check_prereqs {
-    if [ "$INDEXER" != true ]; then
-        if [[ $IP == "" ]]; then
-            log_error "Please provide the IP of the splunk indexer (-h for help)"
+    # Require either an indexer IP or Cloud credentials
+    if [[ "$INDEXER" != true &&
+          -z "$IP" &&
+          -z "$CLOUD_CREDENTIALS" ]]; then
+        log_error "Provide -f <ip> or -c <credentials_path>"
+        exit 1
+    fi
+
+    # Validate Cloud mode
+    if [[ -n "$CLOUD_CREDENTIALS" ]]; then
+        if [[ "$INDEXER" == true || -n "$IP" ]]; then
+            log_error "Cannot combine -c with -i or -f"
             exit 1
         fi
+
+        if [[ ! -f "$CLOUD_CREDENTIALS" ]]; then
+            log_error "Cloud credentials file not found"
+            exit 1
+        fi
+
+        CLOUD_CREDENTIALS="$(realpath "$CLOUD_CREDENTIALS")"
     fi
 
     # Check that user has sudo privileges
@@ -931,6 +950,39 @@ function setup_forwarder {
     # sudo -H -u $SPLUNK_USERNAME $SPLUNK_HOME/bin/splunk set deploy-poll "$1":8089
 }
 
+function install_cloud_credentials {
+    log_info "Installing Splunk Cloud credentials..."
+
+    # Stage the package with restricted permissions
+    local temp_dir
+    temp_dir="$(sudo mktemp -d /tmp/splunk-cloud-XXXXXXXX)" || return 1
+
+    if ! sudo cp -- "$CLOUD_CREDENTIALS" \
+        "$temp_dir/splunkclouduf.spl"; then
+        sudo rm -rf -- "$temp_dir"
+        return 1
+    fi
+
+    sudo chown -R "$SPLUNK_USERNAME:$SPLUNK_USERNAME" "$temp_dir"
+    sudo chmod 700 "$temp_dir"
+    sudo chmod 600 "$temp_dir/splunkclouduf.spl"
+
+    # Install Cloud forwarding configuration
+    sudo -H -u "$SPLUNK_USERNAME" \
+        "$SPLUNK_HOME/bin/splunk" install app \
+        "$temp_dir/splunkclouduf.spl" -update 1
+
+    local result=$?
+    sudo rm -rf -- "$temp_dir"
+
+    if [ "$result" -ne 0 ]; then
+        log_error "Failed to install Cloud credentials"
+        return 1
+    fi
+
+    log_info "Cloud credentials installed successfully"
+}
+
 function install_auditd {
     log_info "Installing auditd..."
 
@@ -1158,6 +1210,8 @@ function main {
     # Setup indexer or forwarder-specific configurations
     if [ "$INDEXER" == true ]; then
         setup_indexer
+    elif [ -n "$CLOUD_CREDENTIALS" ]; then
+        install_cloud_credentials || exit 1
     else
         setup_forwarder "$IP"
     fi
@@ -1224,6 +1278,13 @@ function main {
         sudo -H -u $SPLUNK_USERNAME $SPLUNK_HOME/bin/splunk start
     fi
 
+    if [ -n "$CLOUD_CREDENTIALS" ]; then
+        log_info "Checking Splunk Cloud forwarding status..."
+
+        sudo -H -u "$SPLUNK_USERNAME" \
+            "$SPLUNK_HOME/bin/splunk" list forward-server
+    fi
+
     echo
 
     log_info "Finished!"
@@ -1238,7 +1299,7 @@ function main {
     echo
 }
 
-while getopts "hp:P:df:irg:uSa:Ll:Vv:nD" opt; do
+while getopts "hp:P:df:c:irg:uSa:Ll:Vv:nD" opt; do
     case $opt in
         h)
             print_usage
@@ -1348,6 +1409,9 @@ while getopts "hp:P:df:irg:uSa:Ll:Vv:nD" opt; do
         D)
             debug_installation
             exit 0
+            ;;
+        c)
+            CLOUD_CREDENTIALS="$OPTARG"
             ;;
     esac
 done
