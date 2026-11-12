@@ -487,40 +487,79 @@ function debug_installation {
     fi
 }
 
+
 ### Installation functions ###
 function install_dependencies {
     log_info "Installing dependencies"
 
-    if [ "$PM" == "" ]; then
-        log_warning "No package manager detected."
-    else
-        sudo "$PM" install -qq -y wget curl acl unzip
-        if [ "$PM" == "apt-get" ]; then
-            sudo "$PM" install -qq -y debsums
-            # DEBIAN_FRONTEND=noninteractive sudo "$PM" install -qq -y aide
-        else
-            sudo "$PM" install -qq -y rpm #aide
+    if [ -z "$PM" ]; then
+        log_error "No package manager detected."
+        exit 1
+    fi
+
+    # Install dependencies based on package manager
+    case "$PM" in
+        apt-get)
+            sudo "$PM" install -qq -y wget curl acl unzip debsums
+            ;;
+
+        dnf|yum)
+            sudo "$PM" install -q -y wget curl acl unzip rpm
+            ;;
+
+        zypper)
+            sudo zypper --non-interactive install wget curl acl unzip rpm
+            ;;
+
+        *)
+            log_error "Unsupported package manager: $PM"
+            exit 1
+            ;;
+    esac
+
+    # Check if dependency installation succeeded
+    if [ $? -ne 0 ]; then
+        log_error "Failed to install dependencies"
+        exit 1
+    fi
+
+    # Check if syslog is installed
+    syslog_installed=false
+    for f in /var/log/syslog /var/log/auth.log /var/log/secure /var/log/messages; do
+        if sudo test -e "$f"; then
+            syslog_installed=true
+            break
         fi
+    done
 
-        syslog_installed=false
-        for f in /var/log/syslog /var/log/auth.log /var/log/secure /var/log/auth.log; do
-            if sudo test -e "$f"; then
-                syslog_installed=true
-                break
-            fi
-        done
+    # Install rsyslog if needed
+    if [ "$syslog_installed" == false ]; then
+        log_info "Installing rsyslog..."
 
-        if ! $syslog_installed; then
-            sudo "$PM" install -qq -y rsyslog
+        case "$PM" in
+            apt-get)
+                sudo "$PM" install -qq -y rsyslog
+                ;;
+            dnf|yum)
+                sudo "$PM" install -q -y rsyslog
+                ;;
+            zypper)
+                sudo zypper --non-interactive install rsyslog
+                ;;
+        esac
+
+        if [ $? -ne 0 ]; then
+            log_error "Failed to install rsyslog"
+            exit 1
         fi
     fi
 
+    # Verify dependencies
     if ! command -v wget &>/dev/null; then
         log_error "Please install wget before using this script"
         exit 1
     fi
 
-    # Needed because curl can bypass some wget TLS/SSL errors
     if ! command -v curl &>/dev/null; then
         log_error "Please install curl before using this script"
         exit 1
@@ -535,6 +574,8 @@ function install_dependencies {
         log_error "Please install unzip before using this script"
         exit 1
     fi
+
+    log_success "All dependencies installed successfully"
 }
 
 function check_prereqs {
@@ -649,7 +690,7 @@ function install_package {
             log_info "Even though it may look hung, please be patient - this may take several minutes"
             case "$PM" in
                 zypper )
-                    sudo zypper --no-gpg-checks install -y -qq ./splunk.rpm
+                    sudo zypper --non-interactive install ./splunk.rpm
                 ;;
                 dnf )
                     sudo dnf install --nogpgcheck ./splunk.rpm -y -qq
@@ -989,15 +1030,18 @@ function install_auditd {
     if sudo [ -e /etc/audit/ ]; then
         log_info "auditd already installed"
     else
-        # Install auditd
         log_debug "Installing auditd package"
-        sudo $PM install -qq -y auditd
+
+        if [ "$PM" == "zypper" ]; then
+            sudo zypper --non-interactive install audit
+        else
+            sudo "$PM" install -y auditd ||
+                sudo "$PM" install -y audit
+        fi
+
         if [ $? -ne 0 ]; then
-            sudo $PM install -qq -y audit
-            if [ $? -ne 0 ]; then
-                log_error "auditd installation failed"
-                return 1
-            fi
+            log_error "auditd installation failed"
+            return 1
         fi
     fi
 
